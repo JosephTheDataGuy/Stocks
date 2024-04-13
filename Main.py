@@ -5,6 +5,7 @@ import psycopg2
 from alpha_vantage.timeseries import TimeSeries
 from alpha_vantage.fundamentaldata import FundamentalData
 from Secrets_1 import gather_keys
+import pymysql
 
 def main():
     #gathering all necessary secrets as variables from seperate file not stored in git.
@@ -12,14 +13,24 @@ def main():
     
     #connecting to rds database
     try:
-        connection_string = f"dbname='{rds_database_name}' user='{rds_username}' password='{rds_password}' host='{rds_endpoint}' port=5432"
-        connection = psycopg2.connect(connection_string)
+        connection = pymysql.connect(host=rds_endpoint,user=rds_username,password=rds_password)
+        cursor = connection.cursor()
+        print("Connected to MySQL database successfuly!")
     except Exception as error:
         print(error)
+    
+    #testing connection by displaying mysql version.
+    cursor.execute('select version()')
+    mysql_version = cursor.fetchone()[0]
+    print(f'MySQL version: {mysql_version}')
+    
     #getting user input to retrieve ticker symbol data from alpha vantage api
     state, symbol = get_ticker_data(Alpha_vantage_API_key)
     #storing symbol data into rds
-    store_data_in_postgres(connection, state, symbol)
+    store_data_in_mysql(cursor, state, symbol)
+
+    #committing the transaction and closing the connection
+    connection.commit()
     connection.close()
 
 def get_ticker_data(api_key):
@@ -54,45 +65,52 @@ def get_ticker_data(api_key):
         print('Undefined option selected.')
     return state, symbol
 
-def store_data_in_postgres(connection, df, symbol):
-  """
-  This function stores the provided pandas dataframe (`df`) into a table named
-  after the ticker symbol (`symbol`) in the connected Postgres database (`connection`).
+def store_data_in_mysql(cursor, df, symbol):
+    """
+    This function stores the provided pandas dataframe (`df`) into a table named
+    after the ticker symbol (`symbol`) in the connected MySQL database (`cursor`).
 
-  Args:
-      connection: A psycopg2 connection object to the Postgres database.
-      df: The pandas dataframe containing the data to be stored.
-      symbol: The ticker symbol to be used for the table name.
-  """
+    Args:
+          cursor: A cursor for the MySQL database.
+        df: The pandas dataframe containing the data to be stored.
+        symbol: The ticker symbol to be used for the table name.
+    """
 
-  # Generate the table name dynamically
-  table_name = f"{symbol}_alpha_vantage"
+    # Generate the table name dynamically
+    table_name = f"{symbol}_alpha_vantage"
 
-  # Create the table (if it doesn't exist)
-  try:
-      cursor = connection.cursor()
-      cursor.execute(f"""
-          CREATE TABLE IF NOT EXISTS {table_name} (
-              {", ".join(df.columns)}
-          );
-      """)
-      connection.commit()
-  except Exception as error:
-      print(f"Error creating table {table_name}: {error}")
-      return
+    try:
+        # Check if the table exists
+        cursor.execute("SHOW TABLES LIKE %s", (table_name,))
+        table_exists = cursor.fetchone() is not None
 
-  # Convert dataframe to a list of tuples (suitable for bulk insertion)
-  data = df.to_records(listindex=False)
+        if not table_exists:
+                # If the table doesn't exist, create it based on the DataFrame columns
+                create_table_query = f"CREATE TABLE {table_name} ("
+                for column_name, dtype in df.dtypes.iteritems():
+                    sql_type = get_sql_type(dtype)
+                    create_table_query += f"{column_name} {sql_type}, "
+                create_table_query = create_table_query[:-2] + ")"
+                cursor.execute(create_table_query)
+                print(f"Table '{table_name}' created successfully!")
 
-  # Insert data into the table
-  try:
-      cursor = connection.cursor()
-      insert_query = f"INSERT INTO {table_name} VALUES %s"
-      cursor.executemany(insert_query, data)
-      connection.commit()
-      print(f"Data for symbol {symbol} inserted successfully!")
-  except Exception as error:
-      print(f"Error inserting data into {table_name}: {error}")
+        # Insert data into the table
+        insert_query = f"INSERT INTO {table_name} ({', '.join(df.columns)}) VALUES ({', '.join(['%s']*len(df.columns))})"
+        cursor.executemany(insert_query, df.values.tolist())
+        print("Data stored successfully in MySQL database!")
+    except Exception as error:
+        print("Error storing data in MySQL database:", error)
+
+def get_sql_type(dtype):
+    if dtype == 'int64':
+        return 'INT'
+    elif dtype == 'float64':
+        return 'FLOAT'
+    elif dtype == 'object':
+        return 'VARCHAR(255)'  # Adjust the length as needed for object columns
+    else:
+        return 'VARCHAR(255)'  # Default to VARCHAR for unsupported types
+
 
 if __name__ == "__main__":
     main()
